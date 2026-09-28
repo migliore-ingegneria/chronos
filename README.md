@@ -230,3 +230,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
 ## 📄 License
 
 MIT License - see [LICENSE](LICENSE) for details.
+
+
+## Lock Renewal Guidelines
+- TTL renewal worker running at 1/3 lease duration

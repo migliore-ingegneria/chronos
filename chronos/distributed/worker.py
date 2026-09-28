@@ -85,6 +85,10 @@ class Worker:
         self._current_version: Optional[int] = None
         self._current_outer_params: Optional[Dict[str, Tensor]] = None
 
+        # Heartbeat renewal worker state
+        self._heartbeat_thread: Optional[threading.Thread] = None
+        self._heartbeat_running: bool = False
+
         # Stats
         self._stats = {
             "inner_loops_completed": 0,
@@ -120,6 +124,8 @@ class Worker:
 
     def disconnect(self) -> None:
         """Disconnect from coordinator."""
+        self.stop_heartbeat_renew_worker()
+
         if self._socket:
             try:
                 self._send_deregister()
@@ -131,6 +137,62 @@ class Worker:
             self._context.term()
 
         logger.info(f"Worker {self.worker_id} disconnected")
+
+    def start_heartbeat_renew_worker(self) -> None:
+        """Start the background lock heartbeat renewal worker thread."""
+        if self._heartbeat_running:
+            return
+        self._heartbeat_running = True
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_renew_loop,
+            daemon=True,
+            name=f"heartbeat-{self.worker_id}"
+        )
+        self._heartbeat_thread.start()
+        logger.info(f"Worker {self.worker_id} heartbeat renewal worker started")
+
+    def stop_heartbeat_renew_worker(self) -> None:
+        """Stop the background lock heartbeat renewal worker thread."""
+        self._heartbeat_running = False
+        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
+            self._heartbeat_thread.join(timeout=2.0)
+            logger.info(f"Worker {self.worker_id} heartbeat renewal worker stopped")
+
+    def _heartbeat_renew_loop(self) -> None:
+        """Periodically sends heartbeat requests to renew worker lock TTL."""
+        heartbeat_socket = None
+        if self._context:
+            try:
+                heartbeat_socket = self._context.socket(zmq.REQ)
+                heartbeat_socket.setsockopt(zmq.RCVTIMEO, 2000)
+                heartbeat_socket.setsockopt(zmq.SNDTIMEO, 2000)
+                heartbeat_socket.connect(self.config.coordinator_addr)
+            except Exception as e:
+                logger.warning(f"Failed to create heartbeat socket: {e}")
+
+        while self._heartbeat_running:
+            time.sleep(self.config.heartbeat_interval)
+            if not self._heartbeat_running:
+                break
+            if heartbeat_socket:
+                try:
+                    from chronos.distributed.protocols import HeartbeatRequest
+                    req = HeartbeatRequest(
+                        worker_id=self.worker_id,
+                        current_version=self._current_version,
+                        status="computing" if self._running else "idle"
+                    )
+                    heartbeat_socket.send(req.serialize())
+                    heartbeat_socket.recv()  # ack
+                    logger.debug(f"Worker {self.worker_id} heartbeat renewed successfully")
+                except Exception as e:
+                    logger.debug(f"Heartbeat renewal attempt failed: {e}")
+
+        if heartbeat_socket:
+            try:
+                heartbeat_socket.close()
+            except Exception:
+                pass
 
     def run(self, num_iterations: Optional[int] = None) -> None:
         """
@@ -144,39 +206,42 @@ class Worker:
         iteration = 0
 
         logger.info(f"Worker {self.worker_id} starting main loop")
+        self.start_heartbeat_renew_worker()
 
-        while self._running:
-            if num_iterations is not None and iteration >= num_iterations:
-                break
+        try:
+            while self._running:
+                if num_iterations is not None and iteration >= num_iterations:
+                    break
 
-            try:
-                # 1. Checkout outer params
-                version, outer_params = self._checkout()
-                if outer_params is None:
+                try:
+                    # 1. Checkout outer params
+                    version, outer_params = self._checkout()
+                    if outer_params is None:
+                        time.sleep(self.config.retry_delay)
+                        continue
+
+                    self._current_version = version
+                    self._current_outer_params = outer_params
+
+                    # 2. Run inner optimization
+                    trajectory = self._run_inner_loop(outer_params)
+
+                    # 3. Check significance and commit
+                    if self._should_commit(trajectory):
+                        self._commit(trajectory)
+
+                    iteration += 1
+                    self._stats["inner_loops_completed"] += 1
+
+                except KeyboardInterrupt:
+                    logger.info("Worker interrupted")
+                    break
+                except Exception as e:
+                    logger.error(f"Error in worker loop: {e}")
                     time.sleep(self.config.retry_delay)
-                    continue
-
-                self._current_version = version
-                self._current_outer_params = outer_params
-
-                # 2. Run inner optimization
-                trajectory = self._run_inner_loop(outer_params)
-
-                # 3. Check significance and commit
-                if self._should_commit(trajectory):
-                    self._commit(trajectory)
-
-                iteration += 1
-                self._stats["inner_loops_completed"] += 1
-
-            except KeyboardInterrupt:
-                logger.info("Worker interrupted")
-                break
-            except Exception as e:
-                logger.error(f"Error in worker loop: {e}")
-                time.sleep(self.config.retry_delay)
-
-        self._running = False
+        finally:
+            self.stop_heartbeat_renew_worker()
+            self._running = False
 
     def stop(self) -> None:
         """Stop the worker loop."""
